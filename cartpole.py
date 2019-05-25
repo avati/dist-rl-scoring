@@ -208,8 +208,9 @@ class ReplayMemory(object):
 
 class DQN(nn.Module):
 
-    def __init__(self, h, w, outputs):
+    def __init__(self, h, w, outputs, UNCERTAINTY_FACTOR=1):
         super(DQN, self).__init__()
+        self.UNCERTAINTY_FACTOR = UNCERTAINTY_FACTOR
         self.conv1 = nn.Conv2d(3, 16, kernel_size=5, stride=2)
         self.bn1 = nn.BatchNorm2d(16)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=5, stride=2)
@@ -224,15 +225,41 @@ class DQN(nn.Module):
         convw = conv2d_size_out(conv2d_size_out(conv2d_size_out(w)))
         convh = conv2d_size_out(conv2d_size_out(conv2d_size_out(h)))
         linear_input_size = convw * convh * 32
-        self.head = nn.Linear(linear_input_size, outputs)
+        self.head_mean = nn.Linear(linear_input_size, outputs)
+        self.head_var = nn.Linear(linear_input_size, outputs)
 
     # Called with either one element to determine next action, or a batch
     # during optimization. Returns tensor([[left0exp,right0exp]...]).
     def forward(self, x):
+        m, _ = self.forward_mean_var(x)
+        return m
+
+    def forward_mean_var(self, x):
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.relu(self.bn3(self.conv3(x)))
-        return self.head(x.view(x.size(0), -1))
+        return (self.head_mean(x.view(x.size(0), -1)), self.head_var(x.view(x.size(0), -1)).exp())
+
+    def loss(self, means, vars, targets):
+        mean_loss = F.smooth_l1_loss(means, targets)
+
+        def resid_loss(v, m, t):
+            return F.smooth_l1_loss(v, torch.abs(m.detach() - t))
+
+        def mle_loss(v, m, t):
+            s = torch.sqrt(v)
+            return - Normal(m, s).log_prob(t).mean()
+
+        def crps_loss(v, m, t):
+            s = torch.sqrt(v)
+            z = (t - m) / s
+            n = torch.distributions.normal.Normal(m, s)
+            crps = s * (z * (2 * n.cdf(z) - 1 ) + 2 * n.log_prob(z).exp() - np.power(np.pi, -0.5) )
+            return crps.mean()
+
+        uncertainty_loss = crps_loss(vars, means.detach(), targets)
+
+        return mean_loss + self.UNCERTAINTY_FACTOR * uncertainty_loss
 
 
 ######################################################################
@@ -316,7 +343,7 @@ GAMMA = 0.999
 EPS_START = 0.9
 EPS_END = 0.05
 EPS_DECAY = 200
-TARGET_UPDATE = 10
+TARGET_UPDATE = 2
 
 # Get screen size so that we can initialize layers correctly based on shape
 # returned from AI gym. Typical dimensions at this point are close to 3x40x90
@@ -418,7 +445,8 @@ def optimize_model():
     # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
     # columns of actions taken. These are the actions which would've been taken
     # for each batch state according to policy_net
-    state_action_values = policy_net(state_batch).gather(1, action_batch)
+    means, vars = policy_net.forward_mean_var(state_batch)
+    state_action_values, state_action_vars = means.gather(1, action_batch), vars.gather(1, action_batch)
 
     # Compute V(s_{t+1}) for all next states.
     # Expected values of actions for non_final_next_states are computed based
@@ -431,13 +459,14 @@ def optimize_model():
     expected_state_action_values = (next_state_values * GAMMA) + reward_batch
 
     # Compute Huber loss
-    loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
+    loss = policy_net.loss(state_action_values, state_action_vars, expected_state_action_values.unsqueeze(1))
 
     # Optimize the model
     optimizer.zero_grad()
     loss.backward()
     for param in policy_net.parameters():
-        param.grad.data.clamp_(-1, 1)
+        if param.grad is not None:
+            param.grad.data.clamp_(-1, 1)
     optimizer.step()
 
 
@@ -454,7 +483,7 @@ def optimize_model():
 # duration improvements.
 #
 
-num_episodes = 50
+num_episodes = 500
 for i_episode in range(num_episodes):
     # Initialize the environment and state
     env.reset()
@@ -481,7 +510,7 @@ for i_episode in range(num_episodes):
         # Move to the next state
         state = next_state
 
-        # Perform one step of the optimization (on the target network)
+        # Perform one step of the optimization (on the policy network)
         optimize_model()
         if done:
             episode_durations.append(t + 1)
